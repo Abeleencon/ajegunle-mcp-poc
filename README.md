@@ -17,6 +17,25 @@ flowchart LR
   agent & mcp -->|OTLP| otel[otel-collector] --> xray[(AWS X-Ray)]
 ```
 
+## Why this exists
+
+**The use case.** At its core this is an internal operations assistant. An engineer asks
+"why is my pod crashlooping?" or "how do I rotate this API key?". The agent looks up the
+team's runbooks through MCP tools, does any arithmetic it needs, and answers with the
+concrete steps and the runbook it used. The repo ships four sample runbooks: crashloops,
+high latency, key rotation and node scaling.
+
+**The enterprise problem.** Most companies get stuck putting AI agents into production
+safely, more than building them. This project shows that path end to end, covering what
+security and platform teams usually ask for before they approve an AI tool:
+
+- **Least-privilege AWS access.** The agent pod gets only the permissions it needs, and CI
+  deploys without long-lived keys.
+- **Tracing.** Every model call and tool call is traced, so you can audit what the agent
+  did and why.
+- **Evaluation gates.** A deploy is blocked if answer quality drops.
+- **MCP.** New tools plug in without rewriting the agent.
+
 ## What is where
 
 | Path | What it is |
@@ -158,3 +177,20 @@ Cost note: an EKS control plane, two m6i.large nodes and a NAT gateway run conti
 
 Not yet verified: the agent eval suite against the live Claude API (it needs a key), and
 anything in a real AWS account.
+
+## Next steps
+
+Ideas for building on this proof of concept:
+
+- **Real data sources.** Replace the sample runbooks with Confluence, Jira, PagerDuty, or
+  the CloudWatch and Kubernetes APIs, starting with read-only access.
+- **Incident copilot.** Pull alerts, logs and recent deploys, and draft the first
+  diagnosis in Slack.
+- **Approved actions.** Let the agent propose changes such as scaling a node group or
+  restarting a deployment, and run them only after a human signs off.
+- **Single sign-on with per-user permissions.** Each person's agent reaches only what that
+  person can.
+- **Cost and quality tracking.** Token and cost dashboards, and an eval set that grows
+  from real tickets.
+- **Other domains on the same platform.** HR policy questions, customer support triage,
+  compliance evidence collection.
