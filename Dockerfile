@@ -12,7 +12,12 @@ FROM python:3.12-slim
 ENV PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
-RUN groupadd --gid 10001 app && useradd --uid 10001 --gid app --no-create-home app
+# Pick up Debian security fixes newer than the base image tag.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid app --no-create-home app
 COPY --from=build /opt/venv /opt/venv
 USER 10001:10001
 EXPOSE 8080
