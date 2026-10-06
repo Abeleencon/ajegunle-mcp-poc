@@ -1,0 +1,179 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.12"
+  TERRAFORM_VERSION: "1.13.3"
+
+jobs:
+  python:
+    name: lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -e '.[dev]'
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest -q
+
+  eval-offline:
+    name: eval gate (retrieval, no API key)
+    needs: python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -e .
+      - run: python -m evals.run --suite retrieval --out eval-retrieval.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-retrieval
+          path: eval-retrieval.json
+
+  eval-live:
+    name: eval gate (agent vs Claude)
+    needs: python
+    runs-on: ubuntu-latest
+    # The key lives on a GitHub environment so only this job can read it.
+    environment: evals
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      IS_RELEASE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -e .
+      - name: Run agent evals
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            if [ "$IS_RELEASE" = "true" ]; then
+              echo "::error::ANTHROPIC_API_KEY is not set; a release cannot skip the agent eval gate."
+              exit 1
+            fi
+            echo "::notice::No ANTHROPIC_API_KEY (fork PR or not configured); agent evals skipped."
+            exit 0
+          fi
+          python -m evals.run --suite agent --out eval-agent.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-agent
+          path: eval-agent.json
+          if-no-files-found: ignore
+
+  terraform:
+    name: terraform fmt, validate, policy tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+      - run: terraform test
+
+  kubernetes:
+    name: render and validate manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: kubectl kustomize deploy/k8s/overlays/prod > rendered.yaml
+      - name: kubeconform (strict)
+        run: |
+          cat rendered.yaml deploy/k8s/bootstrap/namespace.yaml | docker run --rm -i \
+            ghcr.io/yannh/kubeconform:v0.7.0 -strict -summary -kubernetes-version 1.33.0 -
+
+  image:
+    name: build and scan image
+    needs: python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -t mcp-agent:ci .
+      - uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: mcp-agent:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+  deploy:
+    name: deploy to EKS
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [python, eval-offline, eval-live, terraform, kubernetes, image]
+    runs-on: ubuntu-latest
+    # Protect this environment with required reviewers. The AWS role trusts only jobs
+    # running in it (infra/terraform/github_oidc.tf).
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+      - name: Apply manifests
+        run: |
+          mkdir -p deploy/k8s/overlays/release
+          cat > deploy/k8s/overlays/release/kustomization.yaml <<EOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources: [../prod]
+          images:
+            - name: mcp-agent
+              newName: ${IMAGE%:*}
+              newTag: ${IMAGE##*:}
+          EOF
+          kubectl apply -k deploy/k8s/overlays/release
+      - name: Wait for rollout
+        run: kubectl -n agent rollout status deploy/mcp-agent --timeout=5m
+      - name: Smoke test
+        run: |
+          kubectl -n agent exec deploy/mcp-agent -c agent -- python -c \
+            "import urllib.request as u; print(u.urlopen('http://127.0.0.1:8080/readyz').read().decode())"
+      - name: Roll back on failure
+        if: failure()
+        run: kubectl -n agent rollout undo deploy/mcp-agent || true

@@ -1,0 +1,11 @@
+{
+  "retrieval": {
+    "min_recall_at_1": 0.85,
+    "min_recall_at_3": 1.0
+  },
+  "agent": {
+    "min_pass_rate": 0.9,
+    "max_avg_steps": 5,
+    "max_p95_latency_s": 90
+  }
+}
